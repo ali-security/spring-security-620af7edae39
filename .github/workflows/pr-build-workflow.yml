@@ -1,22 +1,94 @@
 name: PR Build
 
-on: pull_request
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task selector (e.g. :spring-security-crypto:test --tests FooTests); empty runs the full build'
+        required: false
+        default: ''
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v2
       - name: Set up JDK
-        uses: actions/setup-java@v1
+        uses: actions/setup-java@v4
         with:
+          distribution: 'zulu'
           java-version: '8'
       - name: Cache Gradle packages
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.gradle/caches
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
       - name: Build with Gradle
-        run: ./gradlew clean build --continue
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew clean assemble ${{ inputs.test-filter }}
+          else
+            ./gradlew clean build --continue
+          fi
+      - name: Test results summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, xml.etree.ElementTree as ET
+          from collections import defaultdict
+          tot = defaultdict(lambda: [0, 0, 0, 0])
+          skipped = []
+          srcs = {}
+          for f in glob.glob('**/src/*/java/**/*.java', recursive=True) + glob.glob('**/src/*/kotlin/**/*.kt', recursive=True):
+              key = re.sub(r'^.*/src/[^/]+/(java|kotlin)/', '', f).rsplit('.', 1)[0].replace('/', '.')
+              srcs.setdefault(key, f)
+          def reason(cls, meth):
+              f = srcs.get(cls.split('$')[0])
+              if not f:
+                  return 'source not found'
+              lines = open(f, encoding='utf-8', errors='replace').read().splitlines()
+              name = re.sub(r'\W.*$', '', meth)
+              for i, l in enumerate(lines):
+                  if re.search(r'\b(void|fun)\s+`?' + re.escape(name) + r'\b', l):
+                      for j in range(i - 1, max(i - 8, -1), -1):
+                          m = re.search(r'@(Ignore|Disabled)\b.*', lines[j])
+                          if m:
+                              return 'method annotated ' + m.group(0).strip()
+                      break
+              for l in lines:
+                  m = re.search(r'^\s*@(Ignore|Disabled)\b.*', l)
+                  if m:
+                      return 'class annotated ' + m.group(0).strip()
+              return 'no @Ignore/@Disabled annotation in source; skipped by a JUnit assumption (Assume/Assumptions) at runtime'
+          for x in glob.glob('**/build/test-results/**/*.xml', recursive=True):
+              mod = x.split('/build/test-results/')[0] or '.'
+              try:
+                  r = ET.parse(x).getroot()
+              except Exception:
+                  continue
+              for s in ([r] if r.tag == 'testsuite' else r.iter('testsuite')):
+                  t = tot[mod]
+                  t[0] += int(s.get('tests', 0)); t[1] += int(s.get('failures', 0)); t[2] += int(s.get('errors', 0)); t[3] += int(s.get('skipped', 0))
+                  for tc in s.iter('testcase'):
+                      sk = tc.find('skipped')
+                      if sk is not None:
+                          msg = sk.get('message') or reason(tc.get('classname', ''), tc.get('name', ''))
+                          skipped.append('%s > %s.%s: %s' % (mod, tc.get('classname'), tc.get('name'), msg))
+          g = [0, 0, 0, 0]
+          for mod in sorted(tot):
+              t = tot[mod]
+              g = [a + b for a, b in zip(g, t)]
+              print('TEST SUMMARY %s: tests=%d passed=%d failures=%d errors=%d skipped=%d' % (mod, t[0], t[0] - t[1] - t[2] - t[3], t[1], t[2], t[3]))
+          for s in skipped:
+              print('SKIPPED TEST ' + s)
+          print('TEST TOTAL: modules=%d tests=%d passed=%d failures=%d errors=%d skipped=%d' % (len(tot), g[0], g[0] - g[1] - g[2] - g[3], g[1], g[2], g[3]))
+          PY
+      - name: Upload spring-security-crypto jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-security-crypto
+          path: crypto/build/libs/spring-security-crypto-5.3.6.RELEASE.jar
+          if-no-files-found: error
